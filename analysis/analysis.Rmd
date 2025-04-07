@@ -1,0 +1,365 @@
+---
+title: "Forecasting Ontario Electricity Prices using ARMA"
+author: "Abdel Salam Abuawad"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+The data is sourced from [IESO Yearly Hourly HOEP Report](https://reports-public.ieso.ca/public/PriceHOEPPredispOR/). Note the prices are in terms of CAD/MWh.
+Firstly, we establish the base predictions done by IESO we need to beat.
+Secondly, we show that ARMA is sufficient to beat IESO's forcasts.
+Finally, we show that the residuals closely simulate a white noise process.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+set.seed(123)
+library(stats)
+library(forecast)
+library(tseries)
+library(moments)
+library(e1071)
+library(knitr)
+library(ggplot2)
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(rugarch)
+```
+
+## EDA
+
+```{r}
+# importing and cleaning the data
+IESO25H <- read.csv("data/PUB_PriceHOEPPredispOR_2025_v82.csv") 
+colnames(IESO25H) <- as.character(IESO25H[3,])
+IESO25H <- IESO25H[-c(1, 2,3), ]
+IESO25H <- IESO25H %>%
+mutate(HOEP = as.numeric(HOEP),
+         H1_predicted = as.numeric(`Hour 1 Predispatch`),
+         H2_predicted = as.numeric(`Hour 2 Predispatch`),
+         H3_predicted = as.numeric(`Hour 3 Predispatch`))
+IESO25H$Timestamp <- as.POSIXct(paste(IESO25H$Date, IESO25H$Hour), format="%Y-%m-%d %H")
+IESO25H <- IESO25H[, -c(1,2,4,5,6,7,8,9)]
+IESO25H <- IESO25H[, c(5,1,2,3,4)]
+
+# Replace empty values with the median
+IESO25H[-1] <- lapply(IESO25H[-1], function(col) ifelse(is.na(col), median(col, na.rm = TRUE), col))
+
+# Hour i Predictions
+IESO25H1 <- data.frame(Timestamp = head(IESO25H$Timestamp, -1), HOEP = head(IESO25H$HOEP, -1), H1_predicted = tail(IESO25H$H1_predicted, -1))
+IESO25H2 <- data.frame(Timestamp = head(IESO25H$Timestamp, -2), HOEP = head(IESO25H$HOEP, -2), H2_predicted = tail(IESO25H$H2_predicted, -2))
+IESO25H3 <- data.frame(Timestamp = head(IESO25H$Timestamp, -3), HOEP = head(IESO25H$HOEP, -3), H3_predicted = tail(IESO25H$H3_predicted, -3))
+
+# Hist
+
+ggplot(IESO25H3, aes(x = HOEP)) + 
+  geom_histogram(binwidth = 2, fill = "blue", color = "black") + 
+  ggtitle("Electricity Prices Ontario") + 
+  xlab("Price") + 
+  ylab("Hours")
+
+# TS
+ggplot(IESO25H1, aes(x = Timestamp)) +
+  geom_line(aes(y = HOEP)) +
+  labs(title = "TS plot",
+       x = "Timestamp",
+       y = "HOEP (CAD)") +
+  theme_minimal()
+
+
+# First four moments
+mean_hoep <- mean(IESO25H$HOEP, na.rm = TRUE)
+variance_hoep <- var(IESO25H$HOEP, na.rm = TRUE)
+skewness_hoep <- skewness(IESO25H$HOEP)
+kurtosis_hoep <- kurtosis(IESO25H$HOEP, na.rm = TRUE)
+
+
+# Regular Moments
+moments_table <- data.frame(
+  Moment = c("Mean", "Variance", "Skewness", "Kurtosis"),
+  Value = c(mean_hoep, variance_hoep, skewness_hoep, kurtosis_hoep)
+)
+
+# Display the table in a clean format
+kable(moments_table, col.names = c("Moment", "Value"), caption = "First four moments")
+```
+## Filtering out outliers 3 std. dev. away
+
+```{r}
+
+# 4 Moments after Filtering Outliers
+mean_value <- mean(IESO25H$HOEP, na.rm = TRUE)  # Calculate the mean
+std_dev <- sd(IESO25H$HOEP, na.rm = TRUE)      # Calculate the standard deviation
+
+# Filter data to exclude points more than 3 standard deviations from the mean
+filtered <- IESO25H[abs(IESO25H$HOEP - mean_value) <= 3 * std_dev, ]
+
+outlier_count <- length(IESO25H[abs(IESO25H$HOEP - mean_value) > 3 * std_dev, ]$HOEP) 
+total_count <- length(IESO25H$HOEP)
+percent_outliers <- length(IESO25H[abs(IESO25H$HOEP - mean_value) > 3 * std_dev, ]$HOEP) / length(IESO25H$HOEP) 
+print(paste("Outlier count:", outlier_count))
+print(paste("Total count:", total_count))
+print(paste("Percent of outliers:", percent_outliers))
+       
+# Filtered Hour i Predictions
+IESO25H1 <- data.frame(Timestamp = head(filtered$Timestamp, -1), HOEP = head(filtered$HOEP, -1), H1_predicted = tail(filtered$H1_predicted, -1))
+IESO25H2 <- data.frame(Timestamp = head(filtered$Timestamp, -2), HOEP = head(filtered$HOEP, -2), H2_predicted = tail(filtered$H2_predicted, -2))
+IESO25H3 <- data.frame(Timestamp = head(filtered$Timestamp, -3), HOEP = head(filtered$HOEP, -3), H3_predicted = tail(filtered$H3_predicted, -3))
+
+# 'filtered' now contains the cleaned data
+filtered_kurt <- kurtosis(filtered$HOEP)
+filtered_skew <-skewness(filtered$HOEP)
+filtered_mean <-mean(filtered$HOEP)
+filtered_var <-var(filtered$HOEP)
+
+# Hist
+
+ggplot(filtered, aes(x = HOEP)) + 
+  geom_histogram(binwidth = 2, fill = "blue", color = "black") + 
+  ggtitle("Electricity Prices Ontario") + 
+  xlab("Price") + 
+  ylab("Hours")
+
+# TS
+ggplot(filtered, aes(x = Timestamp)) +
+  geom_line(aes(y = HOEP)) +
+  labs(title = "Outliers-Excluded TS plot",
+       x = "Timestamp",
+       y = "HOEP (CAD)") +
+  theme_minimal()
+
+
+
+# Filtered Moments
+filtered_moments_table <- data.frame(
+  Moment = c("Mean", "Variance", "Skewness", "Kurtosis"),
+  Value = c(filtered_mean, filtered_var, filtered_skew, filtered_kurt)
+)
+
+# Display the table in a clean format
+kable(filtered_moments_table, col.names = c("Moment", "Value"), caption = "Excluding Outliers (3 std.)")
+```
+Motivation for ARMA: the data is stationary according to an ADF test, and an ACF plot suggests some strong autocorrelation across multiple lags. Moreover, the ACF plot exhibits fluctuations, such as a decrease between lags 1 to 5, followed by an increase from lags 5 to 10. This suggests there may be underlying shocks that persist across the data. Thus, we have both autocorrelation, and possibly persistent shocks.
+```{r}
+adf.test(filtered$HOEP, alternative = "stationary")
+acf(filtered$HOEP, main = "ACF Plot")
+
+```
+## IESO's Forecasts
+
+```{r}
+
+# first week predictions
+IESO25H1Jan <- IESO25H1 %>%
+  filter(Timestamp >= as.POSIXct("2025-03-17 01:00:00") & Timestamp <= as.POSIXct("2025-03-24 01:00:00"))
+IESO25H2Jan <- IESO25H2 %>%
+  filter(Timestamp >= as.POSIXct("2025-03-17 01:00:00") & Timestamp <= as.POSIXct("2025-03-24 01:00:00"))
+IESO25H3Jan <- IESO25H3 %>%
+  filter(Timestamp >= as.POSIXct("2025-03-17 01:00:00") & Timestamp <= as.POSIXct("2025-03-24 01:00:00"))
+
+filteredH1 <- filtered %>%
+  filter(Timestamp >= as.POSIXct("2025-03-17 01:00:00") & Timestamp <= as.POSIXct("2025-03-24 01:00:00"))
+
+
+
+# Plot actual HOEP vs predicted HOEP over time
+ggplot(IESO25H1Jan, aes(x = Timestamp)) +
+  geom_line(aes(y = HOEP, color = "Actual")) +
+  geom_line(aes(y = H1_predicted, color = "Predicted")) +
+  labs(title = "Actual vs Predicted HOEP 1 step",
+       x = "Timestamp",
+       y = "HOEP (CAD)",
+       color = "Legend") +
+  theme_minimal()
+
+ggplot(IESO25H2Jan, aes(x = Timestamp)) +
+  geom_line(aes(y = HOEP, color = "Actual")) +
+  geom_line(aes(y = H2_predicted, color = "Predicted")) +
+  labs(title = "Actual vs Predicted HOEP 2 steps",
+       x = "Timestamp",
+       y = "HOEP (CAD)",
+       color = "Legend") +
+  theme_minimal()
+
+ggplot(IESO25H3Jan, aes(x = Timestamp)) +
+  geom_line(aes(y = HOEP, color = "Actual")) +
+  geom_line(aes(y = H3_predicted, color = "Predicted")) +
+  labs(title = "Actual vs Predicted HOEP 3 steps",
+       x = "Timestamp",
+       y = "HOEP (CAD)",
+       color = "Legend") +
+  theme_minimal()
+
+# Residuals for 1 step
+residuals_ieso <- data.frame(residuals = IESO25H1Jan$HOEP - IESO25H1Jan$H1_predicted,
+                               Timestamp = IESO25H1Jan$Timestamp)
+ggplot(residuals_ieso, aes(x = Timestamp)) +
+  geom_line(aes(y = residuals, color = "Actual")) +
+  labs(title = "Residuals of IESO 1 Step",
+       x = "Timestamp",
+       color = "Legend") +
+  theme_minimal()
+
+Box.test(residuals_ieso$residuals, lag = 25, type = "Ljung-Box")
+acf(residuals_ieso$residuals, main = "ACF of Residuals")
+Box.test(residuals_ieso$residuals, lag = 25,  type = "Box-Pierce")
+adf.test(residuals_ieso$residuals)
+```
+
+## ARMA Forecasts
+
+```{r}
+hours <- 24*7
+
+if (nrow(filtered) > hours) {
+filtered_forecasts <- c()
+
+# Loop from 24 down to 1
+for (i in hours:1) {
+  
+  # Subset the 'filtered' data to exclude the last 'i' rows for training
+  filtered_subset <- filtered$HOEP[1:(nrow(filtered) - i)]  
+  ts_filtered <- ts(filtered_subset)  
+
+  filtered_arma_model <- auto.arima(ts_filtered, d = 0) 
+  
+  filtered_fc_arma <- forecast(filtered_arma_model, h = 3, stepwise=FALSE, approximation=FALSE)  
+
+  # Forecast
+  filtered_forecasts <- c(filtered_forecasts, c(filtered_fc_arma$mean[1]))
+
+}
+} else {
+  cat("Error \n")
+}
+
+
+
+results <- data.frame(forecasted = filtered_forecasts,
+                      actual = tail(filtered$HOEP, hours),
+                      IESOPred1 = tail(filtered$H1_predicted, hours),
+                      IESOPred2 = tail(filtered$H2_predicted, hours),
+                      IESOPred3 = tail(filtered$H3_predicted, hours),
+                      Timestamp = tail(filtered$Timestamp,hours),
+                      Residuals = tail(filtered$HOEP, hours) - filtered_forecasts)
+filtered_arma_model
+
+```
+## Graphical Results of forecasts
+
+```{r}
+
+# Print forecast details.
+ggplot(results, aes(x = Timestamp)) +
+  geom_line(aes(y = actual, color = "actual")) +
+  geom_line(aes(y = forecasted, color = "forecasted")) +
+  labs(title = "Actual vs ARMA(3,5) Forecasted",
+       x = "Timestamp",
+       y = "HOEP (CAD)",
+       color = "Legend") +
+  theme_minimal()
+
+ggplot(results, aes(x = Timestamp)) +
+  geom_line(aes(y = actual, color = "actual")) +
+  geom_line(aes(y = IESOPred3, color = "forecasted")) +
+  labs(title = "Actual vs IESO 3 step ",
+       x = "Timestamp",
+       y = "HOEP (CAD)",
+       color = "Legend") +
+  theme_minimal()
+
+
+# Forecasted MAE and RMSE's 
+arma_mae <- mean(abs(results$actual - results$forecasted))
+arma_rmse <- sqrt(mean((results$actual - results$forecasted)^2))
+
+# IESO MAE and RMSE's 
+actual_filtered <- results$actual
+filtered_1_step <- results$IESOPred1
+filtered_2_step <- results$IESOPred2
+filtered_3_step <- results$IESOPred3
+
+mae_ieso_1_step <- mean(abs(actual_filtered - filtered_1_step))
+mae_ieso_2_step <- mean(abs(actual_filtered - filtered_2_step))
+mae_ieso_3_step <- mean(abs(actual_filtered - filtered_3_step))
+
+rmse_ieso_1_step <- sqrt(mean((actual_filtered - filtered_1_step)^2))
+rmse_ieso_2_step <- sqrt(mean((actual_filtered - filtered_2_step)^2))
+rmse_ieso_3_step <- sqrt(mean((actual_filtered - filtered_3_step)^2))
+
+# Table Comparing IESO's performance with ARMA(3,5)
+metrics_table <- data.frame(
+  Model = c("IESO 1", "IESO 2", "IESO 3", "ARMA"),
+  MAE = c(mae_ieso_1_step, mae_ieso_2_step, mae_ieso_3_step, arma_mae),
+  RMSE = c(rmse_ieso_1_step, rmse_ieso_2_step, rmse_ieso_3_step, arma_rmse)
+)
+
+kable(metrics_table, col.names = c("Model", "MAE", "RMSE"), caption = "IESO Predictions vs ARMA(3,5)")
+
+
+```
+## Analyzing Residuals
+
+The Ljung-Box and Box-Pierce test both yield large p-values. Furthermore, we have that acf plot shows little autocorrelation across the residuals, and our adf test shows its stationary. Hence, the residuals show behavior of white noise.
+```{r}
+
+ggplot(results, aes(x = Timestamp)) +
+  geom_line(aes(y = Residuals, color = "Residuals")) +
+  labs(title = "Residuals",
+       x = "Timestamp",
+       y = "HOEP (CAD)",
+       color = "Legend") +
+  theme_minimal()
+Box.test(results$Residuals, lag = 25, type = "Ljung-Box")
+acf(results$Residuals, main = "ACF of Residuals")
+Box.test(results$Residuals, lag = 25,  type = "Box-Pierce")
+adf.test(results$Residuals)
+
+
+
+```
+## Comparing Moments
+
+```{r}
+
+# Compute the first four moments for results$actual
+mean_actual <- mean(results$actual, na.rm = TRUE)
+var_actual <- var(results$actual, na.rm = TRUE)
+skew_actual <- skewness(results$actual, na.rm = TRUE)
+kurt_actual <- kurtosis(results$actual, na.rm = TRUE)
+
+# Compute the first four moments for results$forecasted
+mean_forecasted <- mean(results$forecasted, na.rm = TRUE)
+var_forecasted <- var(results$forecasted, na.rm = TRUE)
+skew_forecasted <- skewness(results$forecasted, na.rm = TRUE)
+kurt_forecasted <- kurtosis(results$forecasted, na.rm = TRUE)
+
+# Compute the first four moments for results$IESOPred
+mean_IESOPred <- mean(results$IESOPred1, na.rm = TRUE)
+var_IESOPred <- var(results$IESOPred1, na.rm = TRUE)
+skew_IESOPred <- skewness(results$IESOPred1, na.rm = TRUE)
+kurt_IESOPred <- kurtosis(results$IESOPred1, na.rm = TRUE)
+
+# Compute Euclidean distances
+euclidean_actual_forecasted <- sqrt(sum((results$actual - results$forecasted)^2, na.rm = TRUE))
+euclidean_actual_IESOPred <- sqrt(sum((results$actual - results$IESOPred1)^2, na.rm = TRUE))
+
+# Create a data frame for the results
+comparison_table <- data.frame(
+  Metric = c("Mean", "Variance", "Skewness", "Kurtosis", "Euclidean Distance"),
+  Actual = c(mean_actual, var_actual, skew_actual, kurt_actual, NA),
+  Forecasted = c(mean_forecasted, var_forecasted, skew_forecasted, kurt_forecasted, euclidean_actual_forecasted),
+  IESOPred = c(mean_IESOPred, var_IESOPred, skew_IESOPred, kurt_IESOPred, euclidean_actual_IESOPred)
+)
+
+# Display the table
+kable(comparison_table, col.names = c("Metric", "Actual", "ARMA", "IESOPred"), caption = "Comparison of Moments and Euclidean Distances")
+```
+
+
+
+
+
